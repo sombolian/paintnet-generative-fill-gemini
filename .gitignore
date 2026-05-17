@@ -1,0 +1,18 @@
+# Build output
+bin/
+obj/
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+*.userprefs
+
+# Plugin runtime config (contains the user's API key)
+GeminiFillPlugin.config.json
+debug.log
+
+# OS junk
+Thumbs.db
+.DS_Store
