@@ -30,13 +30,22 @@ internal static class ConfigStore
         }
     }
 
-    public static void Save(PluginConfig cfg)
+    public static bool Save(PluginConfig cfg, out string? error)
     {
         try
         {
             Directory.CreateDirectory(ConfigDir);
             File.WriteAllText(ConfigPath, JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true }));
+            error = null;
+            return true;
         }
-        catch { }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
     }
+
+    // Back-compat overload for any callers that don't need the error string.
+    public static void Save(PluginConfig cfg) => Save(cfg, out _);
 }

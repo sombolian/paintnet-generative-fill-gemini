@@ -25,6 +25,7 @@ internal sealed class GenerativeFillEffect : PropertyBasedBitmapEffect
     private string model = "gemini-3.1-flash-image-preview";
     private string apiKey = "";
     private bool firstRunDialog;
+    private bool justSavedApiKey;     // set in OnSetToken first-run branch; triggers "run again" message in OnDispose
     private readonly object workLock = new();
 
     public GenerativeFillEffect()
@@ -104,8 +105,17 @@ internal sealed class GenerativeFillEffect : PropertyBasedBitmapEffect
                 {
                     var cfg = ConfigStore.Load();
                     cfg.ApiKey = newKey.Trim();
-                    ConfigStore.Save(cfg);
-                    apiKey = cfg.ApiKey;
+                    if (ConfigStore.Save(cfg, out var saveErr))
+                    {
+                        apiKey = cfg.ApiKey;
+                        justSavedApiKey = true;
+                        Log("Saved API key");
+                    }
+                    else
+                    {
+                        Log("Failed to save API key: " + saveErr);
+                        ShowError("Couldn't save API key to %APPDATA%\\GeminiFillPlugin\\config.json:\n\n" + saveErr);
+                    }
                 }
             }
             else
@@ -150,10 +160,26 @@ internal sealed class GenerativeFillEffect : PropertyBasedBitmapEffect
     // thread inserts the placeholder layer + drives the animation + calls Gemini.
     protected override void OnDispose(bool disposing)
     {
-        if (disposing && !firstRunDialog)
+        if (disposing)
         {
-            try { TryStartAsyncPipeline(); }
-            catch (Exception ex) { Log("OnDispose error: " + ex); }
+            if (firstRunDialog && justSavedApiKey)
+            {
+                // Help users past the first-run trap: tell them the key was saved
+                // and that they need to re-trigger the effect to actually generate.
+                ShowInfo(
+                    "API key saved.\n\n" +
+                    "Run \"Effects, AI, Generative Fill (Gemini)\" again to start generating.\n\n" +
+                    "Next time the dialog will just ask for your prompt and model.");
+            }
+            else if (!firstRunDialog)
+            {
+                try { TryStartAsyncPipeline(); }
+                catch (Exception ex)
+                {
+                    Log("OnDispose error: " + ex);
+                    ShowError("Generative Fill failed to start:\n\n" + ex.Message);
+                }
+            }
         }
         base.OnDispose(disposing);
     }
@@ -162,7 +188,22 @@ internal sealed class GenerativeFillEffect : PropertyBasedBitmapEffect
     {
         string pPrompt, pModel, pApiKey;
         lock (workLock) { pPrompt = prompt; pModel = model; pApiKey = apiKey; }
-        if (string.IsNullOrWhiteSpace(pPrompt) || string.IsNullOrWhiteSpace(pApiKey)) return;
+
+        // Visible feedback on the two ways this can no-op:
+        if (string.IsNullOrWhiteSpace(pApiKey))
+        {
+            ShowError(
+                "No Gemini API key is configured.\n\n" +
+                "Run Generative Fill again, paste your key into the dialog, then run a third time to generate.\n\n" +
+                "Get a free key at https://aistudio.google.com/apikey");
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(pPrompt))
+        {
+            // Probably a deliberate cancel: stay silent so we don't nag the user.
+            Log("Skipping generation: empty prompt");
+            return;
+        }
 
         // Capture everything we need from this.Environment BEFORE going async,
         // since after OnDispose returns the environment is invalidated.
@@ -180,7 +221,20 @@ internal sealed class GenerativeFillEffect : PropertyBasedBitmapEffect
         byte[] croppedMaskPng = EncodeMaskBytesCropToBwPng(maskBytes, docSize, padded);
 
         Form? mainForm = FindMainForm();
-        if (mainForm == null) { Log("Main form not found, aborting"); return; }
+        if (mainForm == null)
+        {
+            // List what we DID see, so a user reporting the bug can paste it.
+            var seen = new System.Text.StringBuilder();
+            foreach (Form f in Application.OpenForms)
+                seen.AppendLine("  - " + (f.GetType().FullName ?? "<null>") + "  text=\"" + (f.Text ?? "") + "\"");
+            Log("FindMainForm returned null. Open forms:\n" + seen);
+            ShowError(
+                "Couldn't find Paint.NET's main window.\n\n" +
+                "This is usually a version mismatch between this plugin and your Paint.NET install. " +
+                "Please file an issue at https://github.com/sombolian/paintnet-generative-fill-gemini/issues " +
+                "and include your Paint.NET version + the debug log at %APPDATA%\\GeminiFillPlugin\\debug.log");
+            return;
+        }
 
         Log($"Request crop: padded={padded.X},{padded.Y} {padded.Width}x{padded.Height}  inner sel={selBounds.X},{selBounds.Y} {selBounds.Width}x{selBounds.Height}");
 
@@ -761,8 +815,34 @@ internal sealed class GenerativeFillEffect : PropertyBasedBitmapEffect
 
     private static Form? FindMainForm()
     {
+        // 1) Exact known type name (Paint.NET 5.1+).
         foreach (Form f in Application.OpenForms)
             if (f.GetType().FullName == "PaintDotNet.Dialogs.MainForm") return f;
+
+        // 2) Anything in a PaintDotNet.* namespace whose class is named MainForm.
+        foreach (Form f in Application.OpenForms)
+        {
+            var tn = f.GetType().FullName ?? "";
+            if (tn.StartsWith("PaintDotNet.", StringComparison.Ordinal) && tn.EndsWith(".MainForm", StringComparison.Ordinal))
+                return f;
+        }
+
+        // 3) Title contains "paint.net" and has no Owner (top-level).
+        foreach (Form f in Application.OpenForms)
+        {
+            if (f.Owner != null) continue;
+            if ((f.Text ?? "").IndexOf("paint.net", StringComparison.OrdinalIgnoreCase) >= 0)
+                return f;
+        }
+
+        // 4) Last resort: any visible top-level form whose type lives in PaintDotNet.*.
+        foreach (Form f in Application.OpenForms)
+        {
+            if (!f.IsHandleCreated || !f.Visible || f.Owner != null) continue;
+            var tn = f.GetType().FullName ?? "";
+            if (tn.StartsWith("PaintDotNet.", StringComparison.Ordinal)) return f;
+        }
+
         return null;
     }
 
@@ -874,11 +954,14 @@ internal sealed class GenerativeFillEffect : PropertyBasedBitmapEffect
 
     // ---------------- Errors ----------------
 
-    private static void ShowError(string msg)
+    private static void ShowError(string msg) => ShowMessage(msg, MessageBoxIcon.Warning);
+    private static void ShowInfo(string msg) => ShowMessage(msg, MessageBoxIcon.Information);
+
+    private static void ShowMessage(string msg, MessageBoxIcon icon)
     {
         var t = new Thread(() =>
         {
-            try { MessageBox.Show(msg, "Generative Fill (Gemini)", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            try { MessageBox.Show(msg, "Generative Fill (Gemini)", MessageBoxButtons.OK, icon); }
             catch { }
         });
         t.SetApartmentState(ApartmentState.STA);
